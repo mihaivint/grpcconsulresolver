@@ -1,95 +1,124 @@
 package consul
 
 import (
+	"net/url"
 	"reflect"
 	"testing"
 )
 
+func mustParseURL(t *testing.T, strURL string) *url.URL {
+	result, err := url.Parse(strURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return result
+}
+
 func TestParseEndpoint(t *testing.T) {
 	tests := []struct {
-		endpoint         string
+		endpoint         *url.URL
 		wantServiceName  string
 		wantScheme       string
 		wantTags         []string
 		wantErr          bool
 		wantHealthFilter healthFilter
+		wantToken        string
 	}{
 		{
-			"user-service-rpc?scheme=https&tags=primary,backup&health=healthy",
+			mustParseURL(t, "consul://127.0.01:8500/user-service-rpc?scheme=https&tags=primary,backup&health=healthy&token=Olj1SIrsGXB_1orYMT71RVCs6FYwGZ_l"),
 			"user-service-rpc",
 			"https",
 			[]string{"primary", "backup"},
 			false,
 			healthFilterOnlyHealthy,
+			"Olj1SIrsGXB_1orYMT71RVCs6FYwGZ_l",
 		},
 
 		{
-			"user-service-rpc?tags=pri-mary,backup&scheme=http&health=fallbackToUnhealthy",
+			mustParseURL(t, "consul://127.0.0.1/user-service-rpc?tags=pri-mary,backup&scheme=http&health=fallbackToUnhealthy"),
 			"user-service-rpc",
 			"http",
 			[]string{"pri-mary", "backup"},
 			false,
 			healthFilterFallbackToUnhealthy,
+			"",
 		},
 
 		{
-			"user-service-rpc",
+			mustParseURL(t, "consul://localhost/user-service-rpc"),
 			"user-service-rpc",
 			"http",
 			nil,
 			false,
 			healthFilterOnlyHealthy,
+			"",
 		},
 
 		{
-			"user-service-rpc?health=blablub",
+			mustParseURL(t, "consul://consul/user-service-rpc?health=blablub"),
 			"",
 			"",
 			nil,
 			true,
 			healthFilterUndefined,
+			"",
 		},
 
 		{
-			"user-service-rpc?scheme=ftp",
+			mustParseURL(t, "consul://consul:8500/user-service-rpc?scheme=ftp"),
 			"",
 			"",
 			nil,
 			true,
 			healthFilterUndefined,
+			"",
 		},
 
 		{
-			"user-service-rpc?scheme=http?tags=primary",
+			mustParseURL(t, "consul://[::1]/user-service-rpc?scheme=http?tags=primary"),
 			"",
 			"",
 			nil,
 			true,
 			healthFilterUndefined,
+			"",
 		},
 
 		{
-			"user-service-rpc?unsupportedparam=yo",
+			mustParseURL(t, "consul://localhost/user-service-rpc?unsupportedparam=yo"),
 			"",
 			"",
 			nil,
 			true,
 			healthFilterUndefined,
+			"",
 		},
 
 		{
+			mustParseURL(t, "consul://127.0.01:8500/user-service-rpc?scheme=http&scheme=https&tags=primary,backup&health=healthy&tags=secondary&health=fallbacktounhealthy"),
+			"user-service-rpc",
+			"https",
+			[]string{"secondary"},
+			false,
+			healthFilterFallbackToUnhealthy,
 			"",
+		},
+
+		{
+			mustParseURL(t, ""),
 			"",
 			"",
 			nil,
 			true,
 			healthFilterUndefined,
+			"",
 		},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.endpoint, func(t *testing.T) {
-			serviceName, scheme, tags, healthFilter, err := parseEndpoint(tt.endpoint)
+		t.Run(tt.endpoint.String(), func(t *testing.T) {
+			serviceName, scheme, tags, healthFilter, token, err := parseEndpoint(tt.endpoint)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("parseEndpoint() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -109,6 +138,10 @@ func TestParseEndpoint(t *testing.T) {
 
 			if healthFilter != tt.wantHealthFilter {
 				t.Errorf("parseEndpoint() gotHealthFilter = %v, want %v", healthFilter, tt.wantHealthFilter)
+			}
+
+			if token != tt.wantToken {
+				t.Errorf("parseEndpoint() gotToken = %s, want %s", token, tt.wantToken)
 			}
 		})
 	}

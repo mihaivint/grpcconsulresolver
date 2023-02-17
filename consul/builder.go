@@ -1,37 +1,41 @@
-package consul
-
 // Package consul implements a GRPC resolver for consul service discovery.
 // The resolver queries consul for healthy services with a specified name.
-// Blocking Consul queries
-// (https://www.consul.io/api/index.html#blocking-queries) are used to monitor
-// consul for changes.
+// [Blocking Consul queries] are used to monitor Consul for changes.
 //
 // To register the resolver with the GRPC-Go library run:
+//
 //	resolver.Register(consul.NewBuilder())
-// Afterwards it can be used by calling grpc.Dial() and passing an URI in the
-// following format: consul://[<consul-server>]/<serviceName>[?<OPT>[&<OPT>]]
-// where OPT:
-//  scheme=(http|https)			  - establish connection to consul via
-//  http or https
-//  tags=<tag>[,<tag>]...		  - filters the consul service by tags
-//  health=(healthy|fallbackToUnhealthy)  - filter services by their
-//					    health checks status.
-//					    fallbackToUnhealthy resolves to
-//					    unhealthy ones if no healthy ones
-//					    are available.
-// Defaults:
-//            consul-server:		127.0.0.1:8500
-//            scheme:			http
-//            tags:			nil
-//	      health:			healthy
-// Example: consul://localhost:1234/user-service?scheme=https&tags=primary,eu
-// Will connect to the consul server localhost:1234 via https and lookup the
-// address of the service with the name "user-service" and the tags "primary"
-// and "eu".
+//
+// Afterwards it can be used by calling [google.golang.org/grpc.Dial] and
+// passing an URL in the following format:
+//
+//	consul://[<consul-server>]/<serviceName>[?<OPT>[&<OPT>]...]
+//
+// When consul-server is not specified 127.0.0.1:8500 is used.
+//
+// OPT is one of:
+//
+//   - scheme=http|https specifies if the connection to Consul is established
+//     via HTTP or HTTPS. Default: http
+//   - tags=<tag>[,<tag>]... only resolves to instances that have the given
+//     tags. Default: empty
+//   - health=healthy|fallbackToUnhealthy filters Services by their health status.
+//     If set to "healthy", the service is only resolved to instances with
+//     passing health checks. If set to "fallbackToUnhealthy", the service
+//     resolves to all instances, if none with a passing status is available.
+//     Default: healthy
+//   - token=<string> includes the token in API-Requests to Consul.
+//
+// If an OPT is defined multiple times, only the value of the last occurrence
+// is used.
+//
+// [Blocking Consul queries]: https://developer.hashicorp.com/consul/api-docs/features/blocking
+package consul
 
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"google.golang.org/grpc/resolver"
@@ -46,56 +50,18 @@ func NewBuilder() resolver.Builder {
 	return &resolverBuilder{}
 }
 
-func endpointParts(endpoint string) (serviceName, opts string, err error) {
-	spl := strings.Split(endpoint, "?")
-	if len(spl) == 1 {
-		return spl[0], "", nil
-	}
-
-	if len(spl) == 2 {
-		return spl[0], spl[1], nil
-	}
-
-	return "", "", errors.New("endpoint contains multiple '?' characters")
-}
-
-func splitOpts(opts string) ([]string, error) {
-	const maxParams = 3
-
-	spl := strings.Split(opts, "&")
-	if len(spl) <= maxParams {
-		return spl, nil
-	}
-
-	return nil, fmt.Errorf("endpoint can only contain <=%d parameters", maxParams)
-}
-
-func splitOptKV(opt string) (key, value string, err error) {
-	spl := strings.Split(opt, "=")
-	if len(spl) == 2 {
-		return spl[0], spl[1], nil
-	}
-
-	return "", "", errors.New("parameter must contain a single '='")
-}
-
-func extractOpts(opts string) (scheme string, tags []string, health healthFilter, err error) {
-	optsSl, err := splitOpts(opts)
-	if err != nil {
-		return "", nil, health, err
-	}
-
-	for _, opt := range optsSl {
-		key, value, err := splitOptKV(opt)
-		if err != nil {
-			return "", nil, healthFilterUndefined, err
+func extractOpts(opts url.Values) (scheme string, tags []string, health healthFilter, token string, err error) {
+	for key, values := range opts {
+		if len(values) == 0 {
+			continue
 		}
+		value := values[len(values)-1]
 
-		switch key = strings.ToLower(key); key {
+		switch strings.ToLower(key) {
 		case "scheme":
 			scheme = strings.ToLower(value)
 			if scheme != "http" && scheme != "https" {
-				return "", nil, healthFilterUndefined, fmt.Errorf("unsupported scheme '%s'", scheme)
+				return "", nil, healthFilterUndefined, "", fmt.Errorf("unsupported scheme '%s'", value)
 			}
 
 		case "tags":
@@ -108,37 +74,33 @@ func extractOpts(opts string) (scheme string, tags []string, health healthFilter
 			case "fallbacktounhealthy":
 				health = healthFilterFallbackToUnhealthy
 			default:
-				return "", nil, healthFilterUndefined, fmt.Errorf("unsupported health parameter value: '%s'", value)
+				return "", nil, healthFilterUndefined, "", fmt.Errorf("unsupported health parameter value: '%s'", value)
 			}
+		case "token":
+			token = value
 
 		default:
-			return "", nil, healthFilterUndefined, fmt.Errorf("unsupported parameter: '%s'", key)
+			return "", nil, healthFilterUndefined, "", fmt.Errorf("unsupported parameter: '%s'", key)
 		}
 	}
 
-	return scheme, tags, health, err
+	return scheme, tags, health, token, err
 }
 
-func parseEndpoint(endpoint string) (serviceName, scheme string, tags []string, health healthFilter, err error) {
+func parseEndpoint(url *url.URL) (serviceName, scheme string, tags []string, health healthFilter, token string, err error) {
 	const defScheme = "http"
 	const defHealthFilter = healthFilterOnlyHealthy
 
-	serviceName, opts, err := endpointParts(endpoint)
-	if err != nil {
-		return "", "", nil, health, err
-	}
-
+	// url.Path contains a leading "/", when the URL is in the form
+	// scheme://host/path, remove it
+	serviceName = strings.TrimPrefix(url.Path, "/")
 	if serviceName == "" {
-		return "", "", nil, health, errors.New("endpoint is empty")
+		return "", "", nil, health, "", errors.New("path is missing in url")
 	}
 
-	if opts == "" {
-		return serviceName, defScheme, nil, defHealthFilter, nil
-	}
-
-	scheme, tags, health, err = extractOpts(opts)
+	scheme, tags, health, token, err = extractOpts(url.Query())
 	if err != nil {
-		return "", "", nil, health, err
+		return "", "", nil, health, "", err
 	}
 
 	if scheme == "" {
@@ -149,16 +111,16 @@ func parseEndpoint(endpoint string) (serviceName, scheme string, tags []string, 
 		health = defHealthFilter
 	}
 
-	return serviceName, scheme, tags, health, nil
+	return serviceName, scheme, tags, health, token, nil
 }
 
 func (*resolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, _ resolver.BuildOptions) (resolver.Resolver, error) {
-	serviceName, scheme, tags, health, err := parseEndpoint(target.URL.RequestURI())
+	serviceName, scheme, tags, health, token, err := parseEndpoint(&target.URL)
 	if err != nil {
 		return nil, err
 	}
 
-	r, err := newConsulResolver(cc, scheme, target.URL.Host, serviceName, tags, health)
+	r, err := newConsulResolver(cc, scheme, target.URL.Host, serviceName, tags, health, token)
 	if err != nil {
 		return nil, err
 	}

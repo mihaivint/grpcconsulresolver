@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"sync"
 	"time"
@@ -54,10 +55,13 @@ func newConsulResolver(
 	scheme, consulAddr, consulService string,
 	tags []string,
 	healthFilter healthFilter,
+	token string,
 ) (*consulResolver, error) {
 	cfg := consul.Config{
-		Address: consulAddr,
-		Scheme:  scheme,
+		Address:  consulAddr,
+		Scheme:   scheme,
+		Token:    token,
+		WaitTime: 10 * time.Minute,
 	}
 
 	health, err := consulCreateHealthClientFn(&cfg)
@@ -111,7 +115,7 @@ func (c *consulResolver) query(opts *consul.QueryOptions) ([]resolver.Address, u
 		}
 
 		result = append(result, resolver.Address{
-			Addr: fmt.Sprintf("%s:%d", addr, e.Service.Port),
+			Addr: net.JoinHostPort(addr, fmt.Sprint(e.Service.Port)),
 		})
 	}
 
@@ -191,6 +195,13 @@ func (c *consulResolver) watcher() {
 				// the timer.
 				c.cc.ReportError(err)
 				break
+			}
+
+			if opts.WaitIndex < lastWaitIndex {
+				grpclog.Infof("grpcconsulresolver: consul responded with a smaller waitIndex (%d) then the previous one (%d), restarting blocking query loop",
+					opts.WaitIndex, lastWaitIndex)
+				opts.WaitIndex = 0
+				continue
 			}
 
 			sort.Slice(addrs, func(i, j int) bool {
